@@ -6,10 +6,10 @@ pipeline {
     }
 
     environment {
-        SLACK_CHANNEL        = 'jenkins-build-notifications'
-        SLACK_CREDENTIALS_ID = 'Aniket'
-        ECR_REGISTRY         = "379466705431.dkr.ecr.us-east-1.amazonaws.com"
-        ECR_REPO             = "clayhr-tomcat"
+        SLACK_CHANNEL        = 'your-slack-chaneel'
+        SLACK_CREDENTIALS_ID = 'slack-credential'
+        ECR_REGISTRY         = "YOUR_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com"
+        ECR_REPO             = "your-app-tomcat"
         AWS_REGION           = "us-east-1"
     }
 
@@ -66,10 +66,10 @@ pipeline {
 
                 script {
                     def projects = [
-                        [name: 'HCM',           actualWar: 'rm.war',             war: 'HCM.war'],
-                        [name: 'BMOne',         actualWar: 'bmone.war',          war: 'BMOne.war'],
-                        [name: 'BMIntegration', actualWar: 'bmintegrations.war', war: 'BMIntegration.war'],
-                        [name: 'Jobboard',      actualWar: 'job-board.war',      war: 'Jobboard.war']
+                        [name: 'Project1',         actualWar: 'app1.war',      war: 'App1.war'],
+                        [name: 'Project2',         actualWar: 'app2.war',      war: 'App2.war'],
+                        [name: 'Project3',         actualWar: 'app3.war',      war: 'App3.war'],
+                        [name: 'Project4',         actualWar: 'app4.war',      war: 'App4.war']
                     ]
 
                     projects.each { proj ->
@@ -94,10 +94,10 @@ pipeline {
                 sh '''
                     echo "--- Final WAR list ---"
                     ls -lh wars/
-                    test -f wars/HCM.war           || exit 1
-                    test -f wars/BMOne.war         || exit 1
-                    test -f wars/BMIntegration.war || exit 1
-                    test -f wars/Jobboard.war      || exit 1
+                    test -f wars/App1.war           || exit 1
+                    test -f wars/App2.war         || exit 1
+                    test -f wars/App3.war || exit 1
+                    test -f wars/App4.war      || exit 1
                     echo "✅ All 4 WARs verified"
                 '''
             }
