@@ -1,0 +1,208 @@
+pipeline {
+    agent any
+
+    environment {
+        AWS_REGION     = 'us-east-1'
+        BUILDX_BUILDER = 'clayhrbuilder'
+        APP_DIR        = 'src/main/python/AskHR/AskHR'
+    }
+
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+        timestamps()
+    }
+
+    stages {
+
+        stage('Set Build Context') {
+            steps {
+                script {
+                    def buildDate = sh(
+                        script: "date +%Y%m%d",
+                        returnStdout: true
+                    ).trim()
+                    def buildTime = sh(
+                        script: "date +%H%M",
+                        returnStdout: true
+                    ).trim()
+                    def gitCommit = sh(
+                        script: "git rev-parse --short=7 HEAD",
+                        returnStdout: true
+                    ).trim()
+                    def gitCommitFull = sh(
+                        script: "git rev-parse HEAD",
+                        returnStdout: true
+                    ).trim()
+
+                    env.GIT_COMMIT_SHORT = gitCommit
+                    env.GIT_COMMIT_FULL  = gitCommitFull
+
+                    def branch = env.BRANCH_NAME
+
+                    if (branch == 'developer') {
+                        env.BUILD_TYPE = 'STAGING'
+                        env.ECR_REPO   = 'askhr-dev'
+                        env.IMAGE_TAG  = "askhrstaging-${buildDate}-${buildTime}"
+
+                    } else if (branch == 'release') {
+                        env.BUILD_TYPE = 'RELEASE'
+                        env.ECR_REPO   = 'askhr-prod'
+                        env.IMAGE_TAG  = "askhrrelease-${buildDate}-${buildTime}"
+
+                    } else {
+                        env.BUILD_TYPE = 'FEATURE'
+                        env.ECR_REPO   = 'askhr-dev'
+                        env.IMAGE_TAG  = "feature-${buildDate}-${buildTime}"
+                    }
+
+                    echo "Branch     : ${branch}"
+                    echo "Build Type : ${env.BUILD_TYPE}"
+                    echo "Image Tag  : ${env.IMAGE_TAG}"
+                    echo "ECR Repo   : ${env.ECR_REPO}"
+                    echo "Git Commit : ${env.GIT_COMMIT_SHORT}"
+                }
+            }
+        }
+
+        stage('ECR Login + Setup Buildx') {
+            steps {
+                script {
+                    def accountId = sh(
+                        script: "aws sts get-caller-identity --query Account --output text",
+                        returnStdout: true
+                    ).trim()
+                    env.ECR_REGISTRY = "${accountId}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+                    env.FULL_IMAGE   = "${env.ECR_REGISTRY}/${env.ECR_REPO}:${env.IMAGE_TAG}"
+
+                    echo "Account ID   : ${accountId}"
+                    echo "ECR Registry : ${env.ECR_REGISTRY}"
+                    echo "Full Image   : ${env.FULL_IMAGE}"
+                }
+                sh """
+                    aws ecr get-login-password --region ${AWS_REGION} | \
+                        docker login --username AWS \
+                        --password-stdin ${env.ECR_REGISTRY}
+                """
+                sh """
+                    docker buildx inspect ${BUILDX_BUILDER} || true
+                    docker buildx use ${BUILDX_BUILDER}
+                    docker buildx inspect --bootstrap
+                """
+                echo "ECR login successful"
+                echo "Buildx builder ${BUILDX_BUILDER} ready"
+            }
+        }
+
+        stage('Build Check (Feature Branch)') {
+            when {
+                not { branch 'developer' }
+                not { branch 'release' }
+            }
+            steps {
+                dir(env.APP_DIR) {
+                    sh """
+                        docker buildx build \
+                            --platform linux/arm64 \
+                            --provenance=false \
+                            --sbom=false \
+                            --tag ${env.FULL_IMAGE} \
+                            .
+                    """
+                }
+                echo "Feature branch build check passed (no push)"
+            }
+        }
+
+        stage('Build and Push Staging') {
+	    when {
+ 		   allOf {
+        		branch 'developer'
+        		changeset "src/main/python/AskHR/**"
+		    }
+		}
+            steps {
+                dir(env.APP_DIR) {
+                    sh """
+                        docker buildx build \
+                            --platform linux/arm64 \
+                            --provenance=false \
+                            --sbom=false \
+                            --push \
+                            --tag ${env.FULL_IMAGE} \
+                            --label git.commit.short=${env.GIT_COMMIT_SHORT} \
+                            --label git.commit.full=${env.GIT_COMMIT_FULL} \
+                            --label git.branch=${env.BRANCH_NAME} \
+                            --label build.date=\$(date +%Y%m%d) \
+                            --label build.time=\$(date +%H%M) \
+                            --label build.type=staging \
+                            .
+                    """
+                }
+                echo "Staging image pushed : ${env.FULL_IMAGE}"
+                echo "Git commit           : ${env.GIT_COMMIT_SHORT}"
+            }
+        }
+
+        stage('Build and Push Release') {
+	    when {
+ 		   allOf {
+        		branch 'release'
+        		changeset "src/main/python/AskHR/**"
+    			}
+		}
+            steps {
+                dir(env.APP_DIR) {
+                    sh """
+                        docker buildx build \
+                            --platform linux/arm64 \
+                            --provenance=false \
+                            --sbom=false \
+                            --push \
+                            --tag ${env.FULL_IMAGE} \
+                            --label git.commit.short=${env.GIT_COMMIT_SHORT} \
+                            --label git.commit.full=${env.GIT_COMMIT_FULL} \
+                            --label git.branch=${env.BRANCH_NAME} \
+                            --label build.date=\$(date +%Y%m%d) \
+                            --label build.time=\$(date +%H%M) \
+                            --label build.type=release \
+                            .
+                    """
+                }
+                echo "Release image pushed : ${env.FULL_IMAGE}"
+                echo "Git commit           : ${env.GIT_COMMIT_SHORT}"
+            }
+        }
+
+        stage('Deploy Instructions') {
+            when { branch 'release' }
+            steps {
+                echo "============================================"
+                echo "RELEASE BUILD READY FOR DEPLOYMENT"
+                echo "============================================"
+                echo "Image      : ${env.FULL_IMAGE}"
+                echo "Git Commit : ${env.GIT_COMMIT_SHORT}"
+                echo "--------------------------------------------"
+                echo "Deploy Core-Prod:"
+                echo "  ./deploy.sh ${env.IMAGE_TAG} core-prod"
+                echo ""
+                echo "Deploy Other Regions (DEV/SG/CA/ZA):"
+                echo "  ./deploy.sh ${env.IMAGE_TAG} other"
+                echo "============================================"
+            }
+        }
+    }
+
+    post {
+        always {
+            sh "docker buildx prune -f --reserved-space 2GB || true"
+            cleanWs()
+            script {
+                if (env.BRANCH_NAME == 'developer') {
+                    echo "STAGING build pushed to ${env.ECR_REPO}: ${env.IMAGE_TAG}"
+                } else if (env.BRANCH_NAME == 'release') {
+                    echo "RELEASE build pushed to ${env.ECR_REPO}: ${env.IMAGE_TAG}"
+                }
+            }
+        }
+    }
+}

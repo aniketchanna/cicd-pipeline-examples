@@ -1,0 +1,213 @@
+pipeline {
+    agent any
+
+    options {
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        SLACK_CHANNEL        = 'jenkins-build-notifications'
+        SLACK_CREDENTIALS_ID = 'Aniket'
+        ECR_REGISTRY         = "379466705431.dkr.ecr.us-east-1.amazonaws.com"
+        ECR_REPO             = "clayhr-tomcat"
+        AWS_REGION           = "us-east-1"
+    }
+
+    parameters {
+        string(name: 'TRIGGERED_BY_USER',   defaultValue: 'unknown', description: 'Jenkins user who triggered')
+        string(name: 'TRIGGERED_BY_JOB',    defaultValue: 'manual',  description: 'Which project triggered')
+        string(name: 'TRIGGERED_BY_BRANCH', defaultValue: 'unknown', description: 'Branch that was built')
+    }
+
+    stages {
+
+        stage('Prepare') {
+            steps {
+                script {
+                    def timestamp = sh(script: "date '+%Y%m%d-%H%M'", returnStdout: true).trim()
+
+                    // Sanitize user — remove @domain part and replace invalid chars
+                    def user = params.TRIGGERED_BY_USER
+                                     .toLowerCase()
+                                     .replaceAll('@.*', '')         // removes @clayhr.com
+                                     .replaceAll('[^a-z0-9]', '-')  // replaces dots/special chars with -
+
+                    // Sanitize branch — replace invalid chars
+                    def branch = params.TRIGGERED_BY_BRANCH
+                                       .toLowerCase()
+                                       .replaceAll('[^a-z0-9]', '-')
+
+                    env.IMAGE_TAG = "clayhrstaging-${timestamp}-${env.BUILD_NUMBER}-${user}-${branch}"
+
+                    currentBuild.description = "${env.IMAGE_TAG}"
+
+                    echo """
+                    ==========================================
+                    Image Tag : ${env.IMAGE_TAG}
+                    User      : ${params.TRIGGERED_BY_USER}
+                    Job       : ${params.TRIGGERED_BY_JOB}
+                    Branch    : ${params.TRIGGERED_BY_BRANCH}
+                    ==========================================
+                    """
+                }
+            }
+        }
+
+        stage('Collect WARs') {
+            steps {
+                slackSend(
+                    channel: env.SLACK_CHANNEL,
+                    color: '#615EFC',
+                    message: "${env.JOB_NAME} #${env.BUILD_NUMBER} → Triggered by *${params.TRIGGERED_BY_USER}* from *${params.TRIGGERED_BY_JOB}* — Building `${env.IMAGE_TAG}` (<${env.BUILD_URL}|Open>)",
+                    tokenCredentialId: env.SLACK_CREDENTIALS_ID
+                )
+
+                sh 'rm -rf wars && mkdir -p wars'
+
+                script {
+                    def projects = [
+                        [name: 'HCM',           actualWar: 'rm.war',             war: 'HCM.war'],
+                        [name: 'BMOne',         actualWar: 'bmone.war',          war: 'BMOne.war'],
+                        [name: 'BMIntegration', actualWar: 'bmintegrations.war', war: 'BMIntegration.war'],
+                        [name: 'Jobboard',      actualWar: 'job-board.war',      war: 'Jobboard.war']
+                    ]
+
+                    projects.each { proj ->
+                        try {
+                            copyArtifacts(
+                                projectName: proj.name,
+                                filter: 'target/*.war',
+                                target: 'wars/',
+                                flatten: true,
+                                selector: lastSuccessful()
+                            )
+                            // Use full path — cd does not persist across sh calls
+                            sh "mv wars/${proj.actualWar} wars/${proj.war}"
+                            echo "✅ Collected and renamed: ${proj.actualWar} → ${proj.war}"
+                        } catch (e) {
+                            error "❌ Could not fetch WAR from ${proj.name}: ${e.message}"
+                        }
+                    }
+                }
+
+                // Verify all 4 WARs exist before building
+                sh '''
+                    echo "--- Final WAR list ---"
+                    ls -lh wars/
+                    test -f wars/HCM.war           || exit 1
+                    test -f wars/BMOne.war         || exit 1
+                    test -f wars/BMIntegration.war || exit 1
+                    test -f wars/Jobboard.war      || exit 1
+                    echo "✅ All 4 WARs verified"
+                '''
+            }
+
+            post {
+                failure {
+                    slackSend(
+                        channel: env.SLACK_CHANNEL,
+                        color: 'danger',
+                        message: "❌ WAR collection failed: ${env.JOB_NAME} #${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)",
+                        tokenCredentialId: env.SLACK_CREDENTIALS_ID
+                    )
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh """
+                    docker build \\
+                        --provenance=false \\
+                        --sbom=false \\
+                        --label "triggered-by=${params.TRIGGERED_BY_USER}" \\
+                        --label "triggered-from=${params.TRIGGERED_BY_JOB}" \\
+                        --label "branch=${params.TRIGGERED_BY_BRANCH}" \\
+                        --label "build-number=${env.BUILD_NUMBER}" \\
+                        -t ${ECR_REPO}:${env.IMAGE_TAG} \\
+                        .
+                """
+            }
+
+            post {
+                success {
+                    slackSend(
+                        channel: env.SLACK_CHANNEL,
+                        color: 'good',
+                        message: "✅ Image built: `${env.IMAGE_TAG}` by *${params.TRIGGERED_BY_USER}* (<${env.BUILD_URL}|Open>)",
+                        tokenCredentialId: env.SLACK_CREDENTIALS_ID
+                    )
+                }
+                failure {
+                    slackSend(
+                        channel: env.SLACK_CHANNEL,
+                        color: 'danger',
+                        message: "❌ Docker build failed: ${env.JOB_NAME} #${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)",
+                        tokenCredentialId: env.SLACK_CREDENTIALS_ID
+                    )
+                }
+            }
+        }
+
+        stage('Push to ECR') {
+            steps {
+                sh """
+                    aws ecr get-login-password --region ${AWS_REGION} | \\
+                    docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+                    docker tag ${ECR_REPO}:${env.IMAGE_TAG} ${ECR_REGISTRY}/${ECR_REPO}:${env.IMAGE_TAG}
+
+                    docker push ${ECR_REGISTRY}/${ECR_REPO}:${env.IMAGE_TAG}
+                """
+            }
+
+            post {
+                success {
+                    slackSend(
+                        channel: env.SLACK_CHANNEL,
+                        color: 'good',
+                        message: "✅ Pushed to ECR: `${env.IMAGE_TAG}` by *${params.TRIGGERED_BY_USER}* (<${env.BUILD_URL}|Open>)",
+                        tokenCredentialId: env.SLACK_CREDENTIALS_ID
+                    )
+                }
+                failure {
+                    slackSend(
+                        channel: env.SLACK_CHANNEL,
+                        color: 'danger',
+                        message: "❌ ECR push failed: ${env.JOB_NAME} #${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)",
+                        tokenCredentialId: env.SLACK_CREDENTIALS_ID
+                    )
+                }
+            }
+        }
+
+        stage('Cleanup') {
+            steps {
+                sh """
+                    docker rmi ${ECR_REPO}:${env.IMAGE_TAG}                      || true
+                    docker rmi ${ECR_REGISTRY}/${ECR_REPO}:${env.IMAGE_TAG}      || true
+                    rm -rf wars/
+                """
+            }
+        }
+    }
+
+    post {
+        success {
+            slackSend(
+                channel: env.SLACK_CHANNEL,
+                color: 'good',
+                message: "✅ *Docker-Aggregator #${env.BUILD_NUMBER} completed*\nImage  : `${env.IMAGE_TAG}`\nBy     : *${params.TRIGGERED_BY_USER}*\nFrom   : *${params.TRIGGERED_BY_JOB}*\nBranch : *${params.TRIGGERED_BY_BRANCH}* (<${env.BUILD_URL}|Open>)",
+                tokenCredentialId: env.SLACK_CREDENTIALS_ID
+            )
+        }
+        failure {
+            slackSend(
+                channel: env.SLACK_CHANNEL,
+                color: 'danger',
+                message: "❌ *Docker-Aggregator #${env.BUILD_NUMBER} FAILED* by *${params.TRIGGERED_BY_USER}* (<${env.BUILD_URL}|Open>)",
+                tokenCredentialId: env.SLACK_CREDENTIALS_ID
+            )
+        }
+    }
+}
